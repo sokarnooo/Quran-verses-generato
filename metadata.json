@@ -1,0 +1,6 @@
+{
+  "name": "Quran Verse Video Generator",
+  "description": "Prototype web app that generates high-quality synced Quran verse video MP4s with Arabic Uthmani text and reciter audio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

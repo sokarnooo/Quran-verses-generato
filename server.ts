@@ -2,11 +2,11 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { spawn } from 'child_process';
 import { SURAHS_LIST, POPULAR_RECITERS, BACKGROUND_OPTIONS } from './src/data/quranData.ts';
+import { generateVideoPipeline } from './src/server/videoGenerator.ts';
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = 3000;
 
 app.use(express.json());
 
@@ -21,6 +21,10 @@ fs.mkdirSync(PUBLIC_BG_DIR, { recursive: true });
 // Ensure fonts directory exists
 const FONTS_DIR = path.resolve(process.cwd(), 'fonts');
 fs.mkdirSync(FONTS_DIR, { recursive: true });
+
+// Ensure job states directory exists
+const JOBS_STATE_DIR = path.resolve(process.cwd(), 'temp_jobs', 'job_states');
+fs.mkdirSync(JOBS_STATE_DIR, { recursive: true });
 
 // Static routes
 app.use('/generated', express.static(GENERATED_DIR));
@@ -50,6 +54,33 @@ export interface JobState {
 }
 
 const jobs = new Map<string, JobState>();
+
+function saveJobState(job: JobState) {
+  jobs.set(job.jobId, job);
+  try {
+    const jobFile = path.join(JOBS_STATE_DIR, `${job.jobId}.json`);
+    fs.writeFileSync(jobFile, JSON.stringify(job));
+  } catch (e) {
+    // Ignore file write errors
+  }
+}
+
+function getJobState(jobId: string): JobState | undefined {
+  if (jobs.has(jobId)) {
+    return jobs.get(jobId);
+  }
+  try {
+    const jobFile = path.join(JOBS_STATE_DIR, `${jobId}.json`);
+    if (fs.existsSync(jobFile)) {
+      const data = JSON.parse(fs.readFileSync(jobFile, 'utf-8')) as JobState;
+      jobs.set(jobId, data);
+      return data;
+    }
+  } catch (e) {
+    // Ignore file read errors
+  }
+  return undefined;
+}
 
 // In-memory cache for verses
 const versesCache = new Map<number, any[]>();
@@ -185,74 +216,49 @@ app.post('/api/generate', (req, res) => {
     createdAt: Date.now()
   };
 
-  jobs.set(jobId, initialJob);
+  saveJobState(initialJob);
 
-  // Spawn Python generator script
-  const pythonScript = path.resolve(process.cwd(), 'scripts', 'quran_video_generator.py');
-  const pythonArgs = [
-    pythonScript,
-    '--surah', String(surahNum),
-    '--start_verse', String(startNum),
-    '--end_verse', String(endNum),
-    '--reciter_id', String(reciter.id),
-    '--job_id', jobId,
-    '--output', outputPath,
-    '--temp_dir', tempDir,
-    '--surah_name_ar', `سورة ${surahMeta.name_arabic}`,
-    '--background', selectedBg
-  ];
-
-  const pyProcess = spawn('python3', pythonArgs, {
-    cwd: process.cwd()
-  });
-
+  // Trigger video generation pipeline asynchronously
   initialJob.status = 'processing';
+  saveJobState(initialJob);
 
-  pyProcess.stdout.on('data', (data) => {
-    const lines = data.toString().split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (parsed.job_id === jobId) {
-          const current = jobs.get(jobId);
-          if (current) {
-            current.stage = parsed.stage || current.stage;
-            current.progress = typeof parsed.progress === 'number' ? parsed.progress : current.progress;
-            current.message = parsed.message || current.message;
+  generateVideoPipeline({
+    chapterNum: surahNum,
+    startVerse: startNum,
+    endVerse: endNum,
+    reciterId: reciter.id,
+    jobId,
+    outputVideoPath: outputPath,
+    tempDir,
+    surahNameAr: `سورة ${surahMeta.name_arabic}`,
+    background: selectedBg,
+    onProgress: (data) => {
+      const current = getJobState(jobId);
+      if (!current) return;
 
-            if (parsed.stage === 'complete') {
-              current.status = 'complete';
-              current.progress = 100;
-              current.videoUrl = `/generated/${outputFileName}`;
-              current.downloadUrl = `/api/download/${jobId}`;
-              current.duration = parsed.duration;
-              current.fileSize = parsed.file_size;
-              current.verseCount = parsed.verse_count;
-            } else if (parsed.stage === 'error') {
-              current.status = 'error';
-              current.error = parsed.error || 'Video generation failed';
-            }
-          }
-        }
-      } catch (e) {
-        // Non-JSON output
-        console.log(`[Python Worker ${jobId}]`, line);
+      current.stage = data.stage || current.stage;
+      current.progress = typeof data.progress === 'number' ? data.progress : current.progress;
+      current.message = data.message || current.message;
+
+      if (data.stage === 'complete') {
+        current.status = 'complete';
+        current.progress = 100;
+        current.videoUrl = `/generated/${outputFileName}`;
+        current.downloadUrl = `/api/download/${jobId}`;
+        current.duration = data.duration;
+        current.fileSize = data.fileSize;
+        current.verseCount = data.verseCount;
       }
-    }
-  });
-
-  pyProcess.stderr.on('data', (data) => {
-    console.error(`[Python Worker ${jobId} Error]`, data.toString());
-  });
-
-  pyProcess.on('close', (code) => {
-    const current = jobs.get(jobId);
-    if (!current) return;
-    if (code !== 0 && current.status !== 'complete') {
+      saveJobState(current);
+    },
+  }).catch((err) => {
+    console.error(`[Video Generation Error for ${jobId}]:`, err);
+    const current = getJobState(jobId);
+    if (current) {
       current.status = 'error';
-      current.error = current.error || `Process exited with error code ${code}`;
+      current.error = err.message || 'Video generation failed';
       current.message = `Failed: ${current.error}`;
+      saveJobState(current);
     }
   });
 
@@ -263,9 +269,236 @@ app.post('/api/generate', (req, res) => {
   });
 });
 
+// API: Streaming Video Generation (SSE - Single Persistent Connection)
+app.post('/api/generate-stream', async (req, res) => {
+  const { surah, startVerse, endVerse, reciterId, background } = req.body;
+
+  const surahNum = parseInt(surah, 10);
+  const startNum = parseInt(startVerse, 10);
+  const endNum = parseInt(endVerse, 10);
+  const selectedBg = typeof background === 'string' && ['black', 'water', 'forest', 'clouds', 'rain'].includes(background)
+    ? background
+    : 'black';
+
+  if (isNaN(surahNum) || surahNum < 1 || surahNum > 114) {
+    return res.status(400).json({ error: 'Invalid Surah number. Must be between 1 and 114.' });
+  }
+
+  const surahMeta = SURAHS_LIST.find((s) => s.id === surahNum);
+  if (!surahMeta) {
+    return res.status(404).json({ error: 'Surah not found.' });
+  }
+
+  if (isNaN(startNum) || startNum < 1 || startNum > surahMeta.verses_count) {
+    return res.status(400).json({
+      error: `Invalid start verse. Surah ${surahMeta.name_simple} has ${surahMeta.verses_count} verses (range 1–${surahMeta.verses_count}).`
+    });
+  }
+
+  if (isNaN(endNum) || endNum < startNum || endNum > surahMeta.verses_count) {
+    return res.status(400).json({
+      error: `Invalid end verse. Must be between start verse (${startNum}) and total verses (${surahMeta.verses_count}).`
+    });
+  }
+
+  const reciter = POPULAR_RECITERS.find((r) => String(r.id) === String(reciterId)) || POPULAR_RECITERS[0];
+  const jobId = `quran_vid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const outputFileName = `${jobId}.mp4`;
+  const outputPath = path.join(GENERATED_DIR, outputFileName);
+  const tempDir = path.resolve(process.cwd(), 'temp_jobs', jobId);
+
+  // Set SSE Headers
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  let isClientConnected = true;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      isClientConnected = false;
+    }
+  });
+
+  const sendSSE = (event: string, data: any) => {
+    if (!isClientConnected || res.writableEnded || res.destroyed) return;
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
+    } catch (e) {
+      // Ignore write errors if socket closed
+    }
+  };
+
+  // Heartbeat to prevent proxy timeouts
+  const heartbeat = setInterval(() => {
+    if (!isClientConnected || res.writableEnded) {
+      clearInterval(heartbeat);
+      return;
+    }
+    try {
+      res.write(': keep-alive\n\n');
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
+    } catch (e) {}
+  }, 2000);
+
+  const initialJob: JobState = {
+    jobId,
+    surah: surahNum,
+    surahNameSimple: surahMeta.name_simple,
+    surahNameArabic: surahMeta.name_arabic,
+    startVerse: startNum,
+    endVerse: endNum,
+    reciterId: reciter.id,
+    reciterName: reciter.name,
+    background: selectedBg,
+    status: 'processing',
+    stage: 'initializing',
+    progress: 5,
+    message: `Initializing: Surah ${surahMeta.name_simple} (${startNum}–${endNum}) with ${reciter.name}`,
+    createdAt: Date.now(),
+  };
+
+  saveJobState(initialJob);
+  sendSSE('progress', initialJob);
+
+  try {
+    const result = await generateVideoPipeline({
+      chapterNum: surahNum,
+      startVerse: startNum,
+      endVerse: endNum,
+      reciterId: reciter.id,
+      jobId,
+      outputVideoPath: outputPath,
+      tempDir,
+      surahNameAr: `سورة ${surahMeta.name_arabic}`,
+      background: selectedBg,
+      onProgress: (data) => {
+        const updated: JobState = {
+          jobId,
+          surah: surahNum,
+          surahNameSimple: surahMeta.name_simple,
+          surahNameArabic: surahMeta.name_arabic,
+          startVerse: startNum,
+          endVerse: endNum,
+          reciterId: reciter.id,
+          reciterName: reciter.name,
+          background: selectedBg,
+          status: 'processing',
+          stage: data.stage || 'processing',
+          progress: typeof data.progress === 'number' ? data.progress : 50,
+          message: data.message || 'Processing video...',
+          createdAt: initialJob.createdAt,
+        };
+        saveJobState(updated);
+        sendSSE('progress', updated);
+      },
+    });
+
+    clearInterval(heartbeat);
+
+    if (fs.existsSync(outputPath)) {
+      const completedState: JobState = {
+        jobId,
+        surah: surahNum,
+        surahNameSimple: surahMeta.name_simple,
+        surahNameArabic: surahMeta.name_arabic,
+        startVerse: startNum,
+        endVerse: endNum,
+        reciterId: reciter.id,
+        reciterName: reciter.name,
+        background: selectedBg,
+        status: 'complete',
+        stage: 'complete',
+        progress: 100,
+        message: 'Video generated successfully!',
+        videoUrl: `/api/video/${jobId}`,
+        downloadUrl: `/api/download/${jobId}`,
+        duration: result.duration,
+        fileSize: result.fileSize,
+        verseCount: result.verseCount,
+        createdAt: initialJob.createdAt,
+      };
+
+      saveJobState(completedState);
+      sendSSE('complete', completedState);
+    } else {
+      throw new Error('Generated output video file not found on server');
+    }
+
+    res.end();
+  } catch (err: any) {
+    clearInterval(heartbeat);
+    console.error(`[SSE Generation Error for ${jobId}]:`, err);
+    const errorState: JobState = {
+      jobId,
+      surah: surahNum,
+      surahNameSimple: surahMeta.name_simple,
+      surahNameArabic: surahMeta.name_arabic,
+      startVerse: startNum,
+      endVerse: endNum,
+      reciterId: reciter.id,
+      reciterName: reciter.name,
+      background: selectedBg,
+      status: 'error',
+      stage: 'error',
+      progress: 100,
+      error: err.message || 'Video generation failed',
+      message: `Failed: ${err.message || 'Video generation failed'}`,
+      createdAt: initialJob.createdAt,
+    };
+    saveJobState(errorState);
+    sendSSE('error', errorState);
+    res.end();
+  }
+});
+
+// API: Stream Video with HTTP 206 Partial Content (Supports seeking on all browsers & iOS Safari)
+app.get('/api/video/:jobId', (req, res) => {
+  const { jobId } = req.params;
+  const filePath = path.join(GENERATED_DIR, `${jobId}.mp4`);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Video not found' });
+  }
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(filePath, { start, end });
+    const head = {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'video/mp4',
+    };
+    res.writeHead(206, head);
+    file.pipe(res);
+  } else {
+    const head = {
+      'Content-Length': fileSize,
+      'Content-Type': 'video/mp4',
+      'Accept-Ranges': 'bytes',
+    };
+    res.writeHead(200, head);
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
 // API: Get Job Status
 app.get('/api/jobs/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const job = getJobState(req.params.jobId);
   if (!job) {
     return res.status(404).json({ error: 'Job not found' });
   }
@@ -274,7 +507,7 @@ app.get('/api/jobs/:jobId', (req, res) => {
 
 // API: Download MP4
 app.get('/api/download/:jobId', (req, res) => {
-  const job = jobs.get(req.params.jobId);
+  const job = getJobState(req.params.jobId);
   if (!job || job.status !== 'complete') {
     return res.status(404).json({ error: 'Video not ready or not found' });
   }

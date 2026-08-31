@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Surah, Reciter, VideoJob, VerseItem } from './types.ts';
 import { SURAHS_LIST, POPULAR_RECITERS } from './data/quranData.ts';
 import { LanguageProvider, useLanguage } from './context/LanguageContext.tsx';
@@ -72,6 +72,8 @@ function MainApp() {
       });
   }, [selectedSurah.id]);
 
+  const abortControllerRef = useRef<AbortController | null>(null);
+
   // When selected Surah changes, reset start/end verses safely
   const handleSelectSurah = (newSurah: Surah) => {
     setSelectedSurah(newSurah);
@@ -80,26 +82,6 @@ function MainApp() {
     setEndVerse(defaultEnd);
     setGlobalError(null);
   };
-
-  // Job polling loop
-  useEffect(() => {
-    if (!currentJob || currentJob.status === 'complete' || currentJob.status === 'error') {
-      return;
-    }
-
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/jobs/${currentJob.jobId}`);
-        if (!res.ok) return;
-        const updated = (await res.json()) as VideoJob;
-        setCurrentJob(updated);
-      } catch (e) {
-        console.error('Error polling job status:', e);
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [currentJob?.jobId, currentJob?.status]);
 
   const handleGenerate = async () => {
     setGlobalError(null);
@@ -111,9 +93,83 @@ function MainApp() {
     }
 
     setIsSubmitting(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
+    const initialJob: VideoJob = {
+      jobId: `quran_vid_${Date.now()}`,
+      surah: selectedSurah.id,
+      surahNameSimple: selectedSurah.name_simple,
+      surahNameArabic: selectedSurah.name_arabic,
+      startVerse,
+      endVerse,
+      reciterId: selectedReciter.id,
+      reciterName: selectedReciter.name,
+      background: selectedBg,
+      status: 'processing',
+      stage: 'initializing',
+      progress: 5,
+      message: 'Connecting to generation engine...',
+      createdAt: Date.now(),
+    };
+    setCurrentJob(initialJob);
+
+    let capturedJobId: string | null = null;
+    let safetyPoller: NodeJS.Timeout | null = null;
+
+    const stopPoller = () => {
+      if (safetyPoller) {
+        clearInterval(safetyPoller);
+        safetyPoller = null;
+      }
+    };
+
+    const startPoller = (jid: string) => {
+      stopPoller();
+      safetyPoller = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/jobs/${jid}`);
+          if (res.ok) {
+            const data: VideoJob = await res.json();
+            if (data.status === 'complete') {
+              stopPoller();
+              setCurrentJob({
+                ...initialJob,
+                ...data,
+                status: 'complete',
+                progress: 100,
+                videoUrl: data.videoUrl || `/api/video/${jid}`,
+                downloadUrl: data.downloadUrl || `/api/download/${jid}`,
+              });
+            } else if (data.status === 'error') {
+              stopPoller();
+              setCurrentJob((prev) => ({
+                ...(prev || initialJob),
+                status: 'error',
+                error: data.error || 'Video generation failed',
+                message: data.message || 'Generation failed',
+              }));
+            } else if (data.status === 'processing') {
+              setCurrentJob((prev) => {
+                if (!prev || prev.status !== 'complete') {
+                  return {
+                    ...(prev || initialJob),
+                    ...data,
+                    status: 'processing',
+                  };
+                }
+                return prev;
+              });
+            }
+          }
+        } catch (e) {
+          // Ignore transient polling fetch errors
+        }
+      }, 1000);
+    };
 
     try {
-      const response = await fetch('/api/generate', {
+      const response = await fetch('/api/generate-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -123,39 +179,109 @@ function MainApp() {
           reciterId: selectedReciter.id,
           background: selectedBg,
         }),
+        signal: controller.signal,
       });
-
-      const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || 'Failed to start video generation');
+        const errJson = await response.json().catch(() => ({}));
+        throw new Error(errJson.error || `Server responded with status ${response.status}`);
       }
 
-      // Initial job state
-      setCurrentJob({
-        jobId: data.jobId,
-        surah: selectedSurah.id,
-        surahNameSimple: selectedSurah.name_simple,
-        surahNameArabic: selectedSurah.name_arabic,
-        startVerse,
-        endVerse,
-        reciterId: selectedReciter.id,
-        reciterName: selectedReciter.name,
-        background: selectedBg,
-        status: 'processing',
-        stage: 'fetching_data',
-        progress: 10,
-        message: 'Job submitted, fetching verse text and audio files...',
-        createdAt: Date.now(),
-      });
+      if (!response.body) {
+        throw new Error('ReadableStream not supported by browser or proxy');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+
+        for (const part of parts) {
+          const trimmed = part.trim();
+          if (!trimmed || trimmed.startsWith(':')) continue;
+
+          const eventMatch = trimmed.match(/event:\s*([^\n]+)/);
+          const dataMatch = trimmed.match(/data:\s*([\s\S]+)/);
+          const eventType = eventMatch ? eventMatch[1].trim() : 'message';
+
+          if (dataMatch) {
+            try {
+              const payload = JSON.parse(dataMatch[1].trim());
+
+              if (payload.jobId && !capturedJobId) {
+                capturedJobId = payload.jobId;
+                startPoller(capturedJobId);
+              }
+
+              if (eventType === 'progress') {
+                setCurrentJob((prev) => ({
+                  ...(prev || initialJob),
+                  ...payload,
+                  status: 'processing',
+                }));
+              } else if (eventType === 'complete') {
+                stopPoller();
+                const jid = payload.jobId || capturedJobId;
+                const completedJob: VideoJob = {
+                  ...initialJob,
+                  ...payload,
+                  status: 'complete',
+                  progress: 100,
+                  videoUrl: payload.videoUrl || (jid ? `/api/video/${jid}` : ''),
+                  downloadUrl: payload.downloadUrl || (jid ? `/api/download/${jid}` : ''),
+                };
+                setCurrentJob(completedJob);
+              } else if (eventType === 'error') {
+                stopPoller();
+                setCurrentJob((prev) => ({
+                  ...(prev || initialJob),
+                  status: 'error',
+                  error: payload.error || 'Video generation failed',
+                  message: payload.message || 'Generation failed',
+                }));
+              }
+            } catch (jsonErr) {
+              console.error('Error parsing SSE json payload:', jsonErr);
+            }
+          }
+        }
+      }
     } catch (err: any) {
-      setGlobalError(err.message || 'An unexpected error occurred');
+      if (err.name === 'AbortError') {
+        stopPoller();
+        console.log('Video generation aborted by user.');
+        return;
+      }
+      console.error('Stream generation error:', err);
+      // Don't overwrite if safety poller already succeeded
+      setCurrentJob((prev) => {
+        if (prev?.status === 'complete') return prev;
+        return {
+          ...(prev || initialJob),
+          status: 'error',
+          error: err.message || 'Generation connection failed',
+          message: 'Generation failed',
+        };
+      });
     } finally {
+      stopPoller();
       setIsSubmitting(false);
+      abortControllerRef.current = null;
     }
   };
 
   const handleReset = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
     setCurrentJob(null);
     setGlobalError(null);
   };
@@ -178,9 +304,9 @@ function MainApp() {
           </div>
         )}
 
-        {/* Active Generation Progress Card */}
-        {isGenerating && currentJob && (
-          <GenerationProgress job={currentJob} />
+        {/* Active Generation Progress or Error Card */}
+        {currentJob && currentJob.status !== 'complete' && (
+          <GenerationProgress job={currentJob} onCancel={handleReset} />
         )}
 
         {/* Completed Video Player Card */}

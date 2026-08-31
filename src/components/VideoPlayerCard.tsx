@@ -38,6 +38,11 @@ export const VideoPlayerCard: React.FC<VideoPlayerCardProps> = ({ job, onReset }
       const targetUrl = job.videoUrl || (job.jobId ? `/api/download/${job.jobId}` : null);
       if (!targetUrl) return;
 
+      if (targetUrl.startsWith('blob:')) {
+        setBlobUrl(targetUrl);
+        return;
+      }
+
       try {
         const response = await fetch(targetUrl);
         if (!response.ok) {
@@ -57,7 +62,7 @@ export const VideoPlayerCard: React.FC<VideoPlayerCardProps> = ({ job, onReset }
 
     return () => {
       isMounted = false;
-      if (activeBlobUrl) {
+      if (activeBlobUrl && !job.videoUrl?.startsWith('blob:')) {
         URL.revokeObjectURL(activeBlobUrl);
       }
     };
